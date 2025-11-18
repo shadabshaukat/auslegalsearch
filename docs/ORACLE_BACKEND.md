@@ -5,7 +5,7 @@ This document explains how to run AUSLegalSearch with Oracle Autonomous Database
 Overview
 - Backend switch is controlled by environment variable AUSLEGALSEARCH_DB_BACKEND.
 - Default remains Postgres. No behavior changes for existing setups.
-- Oracle backend uses python-oracledb via SQLAlchemy and stores vectors as JSON (CLOB). Vector ranking is performed in Python for baseline functionality. Full Oracle VECTOR type + Oracle Text can be added later.
+- Oracle backend uses python-oracledb via SQLAlchemy and stores vectors using the native Oracle VECTOR data type. Similarity search runs SQL-side via vector_distance(), with optional APPROX to leverage HNSW/IVF vector indexes created through DBMS_VECTOR.
 
 Switching Backends
 - Postgres (default)
@@ -30,23 +30,33 @@ Pool/Timeout tuning (shared with Postgres connector)
 - AUSLEGALSEARCH_DB_POOL_RECYCLE=1800
 - AUSLEGALSEARCH_DB_POOL_TIMEOUT=30
 
-Vector scan limit (Oracle only)
-- AUSLEGALSEARCH_ORA_VECTOR_SCAN_LIMIT=5000  # limit rows scanned when ranking vectors in Python
+Oracle AI Vector Search (optional index/bootstrap)
+- AUSLEGALSEARCH_ORA_APPROX=1                    # use APPROX vector_distance() to enable index usage
+- AUSLEGALSEARCH_ORA_AUTO_VECTOR_INDEX=0|1       # auto-create a vector index on embeddings.vector during bootstrap
+- AUSLEGALSEARCH_ORA_INDEX_TYPE=HNSW|IVF
+- AUSLEGALSEARCH_ORA_DISTANCE=COSINE|EUCLIDEAN|EUCLIDEAN_SQUARED|DOT|MANHATTAN|HAMMING
+- AUSLEGALSEARCH_ORA_ACCURACY=90                 # target accuracy for approximate search
+- AUSLEGALSEARCH_ORA_INDEX_PARALLEL=1            # parallelism for index build
+- AUSLEGALSEARCH_ORA_HNSW_NEIGHBORS=16
+- AUSLEGALSEARCH_ORA_HNSW_EFCONSTRUCTION=200
+- AUSLEGALSEARCH_ORA_IVF_PARTITIONS=100
 
 File Changes in this branch
 - db/store.py: Dispatcher that exports the same symbols as before, selecting backend by AUSLEGALSEARCH_DB_BACKEND
 - db/store_postgres.py: Previous Postgres models and helpers (pgvector + FTS)
-- db/store_oracle.py: Oracle models and helpers (JSON vectors + LIKE/py cosine)
+- db/store_oracle.py: Oracle models and helpers (native VECTOR type + SQL vector_distance(); optional DBMS_VECTOR index auto-create)
 - db/connector.py: Dispatcher for connectors
 - db/connector_postgres.py: Previous Postgres connector
 - db/connector_oracle.py: Oracle connector (python-oracledb via SQLAlchemy)
 
-What works on Oracle (baseline)
+What works on Oracle (native VECTOR)
 - Schema creation for core tables (users, documents, embeddings, sessions, etc.)
 - Ingestion (documents + embeddings) using the same code paths
-- Vector search: fetch N rows and rank with Python cosine distance
+- Embeddings stored in Oracle native VECTOR(dim, FLOAT32, DENSE)
+- Vector search: SQL-side vector_distance(e.vector, :qv) with optional APPROX for index usage
+- Optional HNSW/IVF vector indexes via DBMS_VECTOR.CREATE_INDEX (env-gated)
 - BM25-like search: case-insensitive LIKE over documents.content
-- Hybrid search: blends vector and LIKE-based results
+- Hybrid search: blends SQL vector_distance and LIKE-based results
 - FTS endpoint: LIKE-based fallback over documents and metadata JSON text
 
 Postgres-only functionality (not in Oracle baseline)

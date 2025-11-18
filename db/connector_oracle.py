@@ -1,16 +1,14 @@
 """
 Oracle SQLAlchemy engine/session for AUSLegalSearch v3.
 
-- Builds an SQLAlchemy engine for Oracle 23ai (Autonomous DB compatible) using python-oracledb.
+- Builds an SQLAlchemy engine for Oracle 26ai/23ai (Autonomous DB compatible) using python-oracledb.
 - Mirrors pool/timeouts config style used by Postgres connector.
-- Exposes: engine, SessionLocal, JSONType, UUIDType (String proxy), Vector (JSON-backed fallback).
+- Exposes: engine, SessionLocal, DB_URL, JSONType, UUIDType (String proxy), Vector (UserDefinedType emitting Oracle VECTOR).
 
 Notes:
-- For full Oracle VECTOR type support in pure SQL, you'd typically use Oracle's VECTOR(…) column type and SQL functions.
-  SQLAlchemy lacks a first-class Oracle VECTOR type today, so this connector provides a JSON-backed Vector type
-  (TypeDecorator) as a minimal compatibility layer. Vector search in db/store_oracle.py computes distances in Python.
-- This is intended as a functional baseline to enable Oracle backend without changing app imports;
-  performance/tight SQL integration can be incrementally added (e.g., using Oracle VECTOR and DOMAIN INDEX).
+- Requires Oracle AI Vector Search with COMPATIBLE >= 23.4.0 to use the native VECTOR data type and vector_distance().
+- The custom Vector UserDefinedType emits "VECTOR(dim, FLOAT32, DENSE)" and binds dense literals like "[1.0,2.0,...]".
+- Use DBMS_VECTOR to create HNSW/IVF indexes and enable APPROX vector_distance() for index usage.
 
 Env variables (either ORACLE_SQLALCHEMY_URL or the individual fields must be provided):
 - ORACLE_SQLALCHEMY_URL                # e.g. oracle+oracledb://user:pass@myadb_high
@@ -32,7 +30,7 @@ from urllib.parse import quote_plus
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.types import TypeDecorator, Text
+from sqlalchemy.types import UserDefinedType, Text
 from sqlalchemy.dialects.oracle import JSON as OracleJSON
 from sqlalchemy import String
 
@@ -110,35 +108,50 @@ DB_URL = ORACLE_SQLALCHEMY_URL
 JSONType = OracleJSON
 UUIDType = String  # UUIDs stored as VARCHAR2(36) in Oracle backend
 
-class Vector(TypeDecorator):
+class Vector(UserDefinedType):
     """
-    Fallback Vector type for Oracle backend: stores Python list[float] as JSON text (CLOB).
-    This enables minimal parity with the Postgres Vector column, at the cost of SQL-only vector ops.
-    Vector distance computation is performed in Python in db/store_oracle.py.
+    Oracle 26ai VECTOR column type for embeddings.
+
+    Usage:
+        Column(Vector(dim))  -> VECTOR(dim, FLOAT32, DENSE)
+
+    - get_col_spec() emits VECTOR(dim, FLOAT32, DENSE) (or flexible '*' if dim is None)
+    - bind_processor converts Python list/numpy array to textual dense literal: "[1.0,2.0,...]"
+    - result_processor returns value unchanged (vector values are rarely selected in this app)
     """
-    impl = Text
     cache_ok = True
 
-    def __init__(self, dim: int):
-        super().__init__()
+    def __init__(self, dim: int = None, fmt: str = "FLOAT32", storage: str = "DENSE"):
         self.dim = dim
+        self.fmt = (fmt or "FLOAT32").upper()
+        self.storage = (storage or "DENSE").upper()
 
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        try:
-            # Accept list-like, numpy arrays, etc.
-            return json.dumps([float(x) for x in list(value)])
-        except Exception:
-            # As last resort, stringify
-            return json.dumps([])
+    def get_col_spec(self, **kw):
+        dim = "*" if not self.dim else str(int(self.dim))
+        fmt = self.fmt if self.fmt in ("INT8", "FLOAT32", "FLOAT64", "BINARY", "*") else "FLOAT32"
+        stor = self.storage if self.storage in ("DENSE", "SPARSE", "*") else "DENSE"
+        return f"VECTOR({dim}, {fmt}, {stor})"
 
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        try:
-            arr = json.loads(value)
-            # leave as Python list[float]
-            return arr
-        except Exception:
-            return None
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            # Accept list-like / numpy arrays and emit dense textual literal: [v0,v1,...]
+            try:
+                # Try numpy first without hard dependency
+                if hasattr(value, "tolist"):
+                    seq = value.tolist()
+                else:
+                    seq = list(value)
+                return "[" + ",".join(str(float(x)) for x in seq) + "]"
+            except Exception:
+                # If already a string literal like "[...]" pass through
+                if isinstance(value, str) and value.startswith("[") and value.endswith("]"):
+                    return value
+                # Fallback empty vector
+                return "[]"
+        return process
+
+    def result_processor(self, dialect, coltype):
+        # Leave as-is (the app rarely selects the vector column itself)
+        return lambda val: val

@@ -1,16 +1,25 @@
 """
 Oracle backend: Centralized DB models and ORM for auslegalsearchv3.
-- Mirrors the Postgres models but uses Oracle-compatible types and SQL.
-- Vectors are stored as JSON (CLOB) via a TypeDecorator in connector_oracle.Vector.
-- FTS/pg_trgm/pgvector features are not used; searches fall back to LIKE and Python-side vector scoring.
+- Uses Oracle 26ai VECTOR data type for embeddings: Column(Vector(EMBEDDING_DIM)) -> VECTOR(dim, FLOAT32, DENSE)
+- SQL-side similarity with vector_distance(), optional APPROX to leverage HNSW/IVF indexes.
+- LIKE-based fallbacks for simple text search; Oracle Text can be added later if desired.
 
 Notes:
-- This baseline aims for functional parity with minimal core logic changes.
-- Optimize later using Oracle 23ai VECTOR type and Oracle Text, if available.
+- Ensure COMPATIBLE init parameter is >= 23.4.0 for VECTOR support.
+- VECTOR columns accept dense textual binds like "[1.0,2.0,...]" via the custom SQLAlchemy type.
+- Optional auto-index creation via DBMS_VECTOR.CREATE_INDEX (env gated).
 
 Env:
 - AUSLEGALSEARCH_EMBED_DIM (default 768)
-- AUSLEGALSEARCH_ORA_VECTOR_SCAN_LIMIT (default 5000)  # max rows scanned for Python-side vector ranking
+- AUSLEGALSEARCH_ORA_APPROX=1           # use APPROX vector_distance() to enable index usage
+- AUSLEGALSEARCH_ORA_AUTO_VECTOR_INDEX=0|1
+- AUSLEGALSEARCH_ORA_INDEX_TYPE=HNSW|IVF
+- AUSLEGALSEARCH_ORA_DISTANCE=COSINE|EUCLIDEAN|EUCLIDEAN_SQUARED|DOT|MANHATTAN|HAMMING
+- AUSLEGALSEARCH_ORA_ACCURACY=90        # target accuracy for approximate search
+- AUSLEGALSEARCH_ORA_INDEX_PARALLEL=1   # parallelism for index build
+- AUSLEGALSEARCH_ORA_HNSW_NEIGHBORS=16
+- AUSLEGALSEARCH_ORA_HNSW_EFCONSTRUCTION=200
+- AUSLEGALSEARCH_ORA_IVF_PARTITIONS=100
 """
 
 from sqlalchemy.orm import declarative_base, relationship
@@ -56,7 +65,7 @@ class Embedding(Base):
     id = Column(Integer, primary_key=True)
     doc_id = Column(Integer, ForeignKey('documents.id'), index=True)
     chunk_index = Column(Integer, nullable=False)
-    vector = Column(Vector(EMBEDDING_DIM), nullable=False)  # stored as JSON text via TypeDecorator
+    vector = Column(Vector(EMBEDDING_DIM), nullable=False)  # Oracle 26ai native VECTOR(dim, FLOAT32, DENSE)
     chunk_metadata = Column(JSONB, nullable=True)
     document = relationship("Document", backref="embeddings")
 
@@ -199,8 +208,67 @@ class TreatyCitationRef(Base):
     citation = Column(Text, nullable=False)
 
 def create_all_tables():
-    # Oracle baseline: just create tables if missing (no extensions/FTS triggers).
+    # Create core tables
     Base.metadata.create_all(engine)
+
+    # Optional: auto-create Oracle 26ai VECTOR index for embeddings.vector
+    # Guarded by AUSLEGALSEARCH_ORA_AUTO_VECTOR_INDEX=1
+    if os.environ.get("AUSLEGALSEARCH_ORA_AUTO_VECTOR_INDEX", "0") == "1":
+        idx_name = os.environ.get("AUSLEGALSEARCH_ORA_INDEX_NAME", "IDX_EMBED_VECTOR")
+        idx_type = (os.environ.get("AUSLEGALSEARCH_ORA_INDEX_TYPE", "HNSW") or "HNSW").upper()  # HNSW | IVF
+        org = "INMEMORY NEIGHBOR GRAPH" if idx_type == "HNSW" else "NEIGHBOR PARTITIONS"
+        metric = (os.environ.get("AUSLEGALSEARCH_ORA_DISTANCE", "COSINE") or "COSINE").upper()
+        acc = int(os.environ.get("AUSLEGALSEARCH_ORA_ACCURACY", "90"))
+        par = int(os.environ.get("AUSLEGALSEARCH_ORA_INDEX_PARALLEL", "1"))
+
+        params = {}
+        if idx_type == "HNSW":
+            params = {
+                "type": "HNSW",
+                "neighbors": int(os.environ.get("AUSLEGALSEARCH_ORA_HNSW_NEIGHBORS", "16")),
+                "efConstruction": int(os.environ.get("AUSLEGALSEARCH_ORA_HNSW_EFCONSTRUCTION", "200")),
+            }
+        else:
+            params = {
+                "type": "IVF",
+                "partitions": int(os.environ.get("AUSLEGALSEARCH_ORA_IVF_PARTITIONS", "100")),
+            }
+        import json as _json
+        params_json = _json.dumps(params)
+
+        # Use DBMS_VECTOR.CREATE_INDEX to create the vector index if possible
+        plsql = text("""
+        BEGIN
+          DBMS_VECTOR.CREATE_INDEX(
+            idx_name               => :idx_name,
+            table_name             => 'EMBEDDINGS',
+            idx_vector_col         => 'VECTOR',
+            idx_include_cols       => NULL,
+            idx_partitioning_scheme=> 'GLOBAL',
+            idx_organization       => :org,
+            idx_distance_metric    => :metric,
+            idx_accuracy           => :acc,
+            idx_parameters         => :params,
+            idx_parallel_creation  => :par
+          );
+        EXCEPTION
+          WHEN OTHERS THEN
+            -- Ignore errors (e.g., insufficient privileges, already exists)
+            NULL;
+        END;
+        """)
+        try:
+            with engine.begin() as conn:
+                conn.execute(plsql, {
+                    "idx_name": idx_name,
+                    "org": org,
+                    "metric": metric,
+                    "acc": acc,
+                    "params": params_json,
+                    "par": par,
+                })
+        except Exception as e:
+            print(f"[Oracle] Vector index creation skipped: {e}")
 
 # --- User CRUD and Auth logic ---
 def hash_password(password: str) -> str:
@@ -366,39 +434,48 @@ def _cosine_distance(a: List[float], b: List[float]) -> float:
 
 def search_vector(query_vec, top_k=5):
     """
-    Oracle baseline: fetch up to N embeddings and rank by Python-side cosine distance.
-    N defaults to AUSLEGALSEARCH_ORA_VECTOR_SCAN_LIMIT (5000).
+    Oracle VECTOR search using SQL-side vector_distance() with optional APPROX
+    to enable HNSW/IVF vector index usage when present.
+
+    Env:
+      - AUSLEGALSEARCH_ORA_APPROX=1 (default) to use APPROX keyword for index
     """
-    scan_limit = int(os.environ.get("AUSLEGALSEARCH_ORA_VECTOR_SCAN_LIMIT", "5000"))
-    qv = [float(v) for v in list(query_vec or [])]
+    approx = os.environ.get("AUSLEGALSEARCH_ORA_APPROX", "1") == "1"
+    # Prepare dense textual literal for the bind (e.g., "[1.0,2.0,...]")
+    try:
+        seq = query_vec.tolist() if hasattr(query_vec, "tolist") else list(query_vec or [])
+    except Exception:
+        seq = []
+    qv_text = "[" + ",".join(str(float(v)) for v in seq) + "]"
+    order_expr = "APPROX vector_distance(e.vector, :qv)" if approx else "vector_distance(e.vector, :qv)"
 
+    sql = f"""
+        SELECT e.doc_id,
+               e.chunk_index,
+               {order_expr} AS score,
+               d.content,
+               d.source,
+               d.format,
+               e.chunk_metadata
+          FROM embeddings e
+          JOIN documents d ON e.doc_id = d.id
+         ORDER BY {order_expr}
+         FETCH FIRST :topk ROWS ONLY
+    """
     with SessionLocal() as session:
-        # Limited scan to avoid full table scan at large scale
-        sql = text("""
-            SELECT e.doc_id, e.chunk_index, e.vector, e.chunk_metadata, d.content, d.source, d.format
-            FROM embeddings e
-            JOIN documents d ON e.doc_id = d.id
-            WHERE ROWNUM <= :lim
-        """)
-        rows = session.execute(sql, {"lim": scan_limit}).fetchall()
-
-        ranked = []
+        rows = session.execute(text(sql), {"qv": qv_text, "topk": int(top_k)}).fetchall()
+        hits = []
         for row in rows:
-            doc_id = row[0]
-            chunk_index = row[1]
-            vec = row[2] or []
-            score = _cosine_distance(vec, qv)
-            ranked.append({
-                "doc_id": doc_id,
-                "chunk_index": chunk_index,
-                "score": score,
-                "text": row[4],
-                "source": row[5],
-                "format": row[6],
-                "chunk_metadata": row[3],
+            hits.append({
+                "doc_id": row[0],
+                "chunk_index": row[1],
+                "score": row[2],
+                "text": row[3],
+                "source": row[4],
+                "format": row[5],
+                "chunk_metadata": row[6],
             })
-        ranked.sort(key=lambda x: x["score"])
-        return ranked[:top_k]
+        return hits
 
 def search_bm25(query, top_k=5):
     """
